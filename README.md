@@ -212,6 +212,8 @@ spec:
 EOF
 ```
 
+NOTE: Above KafkaNodePool is using non-jbod based storage, update it accordingly if you want to use jbod based storage.
+
 Wait for the node pool pods to become ready:
 
 ```bash
@@ -306,6 +308,8 @@ spec:
     class: <storage-class>
 EOF
 ```
+
+NOTE: Above KafkaNodePool is using non-jbod based storage, update it accordingly if you want to use jbod based storage.
 
 Wait for the new pool and its pods to be ready before proceeding.
 
@@ -411,6 +415,8 @@ spec:
     class: <storage-class>
 EOF
 ```
+
+NOTE: Above KafkaNodePool is using non-jbod based storage, update it accordingly if you want to use jbod based storage.
 
 Wait for the controller pool pods to be ready:
 
