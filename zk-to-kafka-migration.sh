@@ -38,9 +38,12 @@ Arguments:
 Options:
     --controller-pool-name NAME    Name for the controller node pool (default: controller-{kafka-instance-name})
     --controller-replicas NUM       Number of controller replicas (default: ZooKeeper replicas from Kafka resource)
-    --controller-storage-type TYPE  Storage type for controller node pool (default: persistent-claim, options: persistent-claim, ephemeral)
-    --controller-storage-size SIZE  Storage size for controller node pool (required if storage type is persistent-claim)
-    --controller-storage-class CLASS Storage class for controller node pool (default: ZooKeeper storage class from Kafka resource)
+    --controller-storage-type TYPE  Storage type for controller node pool (default: matches broker storage, options: persistent-claim, ephemeral, jbod)
+    --controller-storage-sizes SIZES Storage size(s) for controller node pool
+                                     For non-JBOD: single size (e.g., "200Gi")
+                                     For JBOD: comma-separated list (e.g., "100Gi,200Gi,300Gi")
+                                     Required if storage type is persistent-claim or jbod
+    --controller-storage-class CLASS Storage class for controller node pool (default: matches broker storage or ZooKeeper storage class)
     --wait-timeout SECONDS          Timeout for waiting on migration states (default: 3600)
     --skip-prereq-check             Skip prerequisite checks
     --help                          Show this help message
@@ -48,8 +51,9 @@ Options:
 Examples:
     $0 my-namespace my-kafka
     $0 my-namespace my-kafka --controller-pool-name my-controller-pool
-    $0 my-namespace my-kafka --controller-replicas 5 --controller-storage-size 200Gi
-    $0 my-namespace my-kafka --controller-storage-size 200Gi --controller-storage-class fast-ssd
+    $0 my-namespace my-kafka --controller-replicas 5 --controller-storage-sizes 200Gi
+    $0 my-namespace my-kafka --controller-storage-sizes 200Gi --controller-storage-class fast-ssd
+    $0 my-namespace my-kafka --controller-storage-type jbod --controller-storage-sizes "100Gi,200Gi,300Gi"
 EOF
     exit 1
 }
@@ -59,9 +63,9 @@ WAIT_TIMEOUT=3600
 SKIP_PREREQ_CHECK=false
 CONTROLLER_POOL_NAME=""  # Will be set to default if not provided
 CONTROLLER_REPLICAS=""   # Will use ZooKeeper replicas as default if not provided
-CONTROLLER_STORAGE_TYPE=""  # Will default to persistent-claim if not provided
-CONTROLLER_STORAGE_SIZE=""  # Required if storage type is persistent-claim
-CONTROLLER_STORAGE_CLASS=""  # Will use ZooKeeper storage class as default if not provided
+CONTROLLER_STORAGE_TYPE=""  # Will default to broker storage type if not provided
+CONTROLLER_STORAGE_SIZES=""  # Comma-separated list for JBOD, single value for non-JBOD
+CONTROLLER_STORAGE_CLASS=""  # Will use broker storage class or ZooKeeper storage class as default if not provided
 
 # Parse command line arguments
 if [[ $# -lt 2 ]]; then
@@ -89,7 +93,13 @@ while [[ $# -gt 0 ]]; do
             shift 2
             ;;
         --controller-storage-size)
-            CONTROLLER_STORAGE_SIZE="$2"
+            # Support old parameter name for backward compatibility
+            CONTROLLER_STORAGE_SIZES="$2"
+            print_warning "--controller-storage-size is deprecated, use --controller-storage-sizes instead"
+            shift 2
+            ;;
+        --controller-storage-sizes)
+            CONTROLLER_STORAGE_SIZES="$2"
             shift 2
             ;;
         --controller-storage-class)
@@ -169,6 +179,148 @@ get_kafkanodepool_api_version() {
 }
 
 
+# Function to build JBOD storage YAML from Kafka resource
+build_jbod_storage_yaml_from_kafka() {
+    local storage_yaml="    type: jbod\n    volumes:"
+    
+    # Get volumes count by checking how many volume IDs exist
+    local volume_ids=$(oc get kafka "$KAFKA_INSTANCE" -n "$NAMESPACE" -o jsonpath='{.spec.kafka.storage.volumes[*].id}' 2>/dev/null)
+    
+    if [[ -z "$volume_ids" || "$volume_ids" == "null" ]]; then
+        print_error "JBOD volumes not found in Kafka resource spec.kafka.storage.volumes"
+        exit 1
+    fi
+    
+    # Count volumes by counting space-separated IDs
+    local volume_count=$(echo "$volume_ids" | wc -w)
+    
+    # Process each volume
+    for ((i=0; i<volume_count; i++)); do
+        local vol_id=$(oc get kafka "$KAFKA_INSTANCE" -n "$NAMESPACE" -o jsonpath="{.spec.kafka.storage.volumes[$i].id}" 2>/dev/null)
+        local vol_type=$(oc get kafka "$KAFKA_INSTANCE" -n "$NAMESPACE" -o jsonpath="{.spec.kafka.storage.volumes[$i].type}" 2>/dev/null)
+        local vol_size=$(oc get kafka "$KAFKA_INSTANCE" -n "$NAMESPACE" -o jsonpath="{.spec.kafka.storage.volumes[$i].size}" 2>/dev/null)
+        local vol_class=$(oc get kafka "$KAFKA_INSTANCE" -n "$NAMESPACE" -o jsonpath="{.spec.kafka.storage.volumes[$i].class}" 2>/dev/null)
+        local vol_delete_claim=$(oc get kafka "$KAFKA_INSTANCE" -n "$NAMESPACE" -o jsonpath="{.spec.kafka.storage.volumes[$i].deleteClaim}" 2>/dev/null)
+        
+        if [[ -z "$vol_id" || "$vol_id" == "null" ]]; then
+            print_error "Volume $i missing required 'id' field"
+            exit 1
+        fi
+        if [[ -z "$vol_type" || "$vol_type" == "null" ]]; then
+            print_error "Volume $i (id=$vol_id) missing required 'type' field"
+            exit 1
+        fi
+        
+        storage_yaml="${storage_yaml}\n    - id: ${vol_id}\n      type: ${vol_type}"
+        
+        if [[ -n "$vol_size" && "$vol_size" != "null" ]]; then
+            storage_yaml="${storage_yaml}\n      size: ${vol_size}"
+        fi
+        
+        if [[ -n "$vol_class" && "$vol_class" != "null" ]]; then
+            storage_yaml="${storage_yaml}\n      class: ${vol_class}"
+        fi
+        
+        if [[ -n "$vol_delete_claim" && "$vol_delete_claim" != "null" ]]; then
+            storage_yaml="${storage_yaml}\n      deleteClaim: ${vol_delete_claim}"
+        fi
+    done
+    
+    echo -e "$storage_yaml"
+}
+
+# Function to build JBOD storage YAML from existing node pool
+build_jbod_storage_yaml_from_pool() {
+    local pool_name=$1
+    local storage_yaml="    type: jbod\n    volumes:"
+    
+    # Get volumes count
+    local volume_ids=$(oc get kafkanodepool "$pool_name" -n "$NAMESPACE" -o jsonpath='{.spec.storage.volumes[*].id}' 2>/dev/null)
+    
+    if [[ -z "$volume_ids" || "$volume_ids" == "null" ]]; then
+        print_error "JBOD volumes not found in node pool '$pool_name'"
+        exit 1
+    fi
+    
+    # Count volumes
+    local volume_count=$(echo "$volume_ids" | wc -w)
+    
+    # Process each volume
+    for ((i=0; i<volume_count; i++)); do
+        local vol_id=$(oc get kafkanodepool "$pool_name" -n "$NAMESPACE" -o jsonpath="{.spec.storage.volumes[$i].id}" 2>/dev/null)
+        local vol_type=$(oc get kafkanodepool "$pool_name" -n "$NAMESPACE" -o jsonpath="{.spec.storage.volumes[$i].type}" 2>/dev/null)
+        local vol_size=$(oc get kafkanodepool "$pool_name" -n "$NAMESPACE" -o jsonpath="{.spec.storage.volumes[$i].size}" 2>/dev/null)
+        local vol_class=$(oc get kafkanodepool "$pool_name" -n "$NAMESPACE" -o jsonpath="{.spec.storage.volumes[$i].class}" 2>/dev/null)
+        local vol_delete_claim=$(oc get kafkanodepool "$pool_name" -n "$NAMESPACE" -o jsonpath="{.spec.storage.volumes[$i].deleteClaim}" 2>/dev/null)
+        
+        if [[ -z "$vol_id" || "$vol_id" == "null" ]]; then
+            print_error "Volume $i missing required 'id' field in pool '$pool_name'"
+            exit 1
+        fi
+        if [[ -z "$vol_type" || "$vol_type" == "null" ]]; then
+            print_error "Volume $i (id=$vol_id) missing required 'type' field in pool '$pool_name'"
+            exit 1
+        fi
+        
+        storage_yaml="${storage_yaml}\n    - id: ${vol_id}\n      type: ${vol_type}"
+        
+        if [[ -n "$vol_size" && "$vol_size" != "null" ]]; then
+            storage_yaml="${storage_yaml}\n      size: ${vol_size}"
+        fi
+        
+        if [[ -n "$vol_class" && "$vol_class" != "null" ]]; then
+            storage_yaml="${storage_yaml}\n      class: ${vol_class}"
+        fi
+        
+        if [[ -n "$vol_delete_claim" && "$vol_delete_claim" != "null" ]]; then
+            storage_yaml="${storage_yaml}\n      deleteClaim: ${vol_delete_claim}"
+        fi
+    done
+    
+    echo -e "$storage_yaml"
+}
+
+# Function to build JBOD storage YAML from comma-separated sizes
+build_jbod_storage_yaml_from_sizes() {
+    local sizes_list=$1
+    local storage_class=$2  # Optional storage class to apply to all volumes
+    local storage_yaml="    type: jbod\n    volumes:"
+    
+    # Save original IFS and set to comma for splitting
+    local old_ifs="$IFS"
+    IFS=','
+    read -ra SIZES <<< "$sizes_list"
+    IFS="$old_ifs"  # Restore IFS immediately
+    
+    local vol_id=0
+    
+    for size in "${SIZES[@]}"; do
+        # Trim whitespace
+        size=$(echo "$size" | xargs)
+        
+        if [[ -z "$size" ]]; then
+            print_warning "Skipping empty size in list"
+            continue
+        fi
+        
+        storage_yaml="${storage_yaml}\n    - id: ${vol_id}\n      type: persistent-claim\n      size: ${size}"
+        
+        # Add storage class if provided
+        if [[ -n "$storage_class" && "$storage_class" != "null" ]]; then
+            storage_yaml="${storage_yaml}\n      class: ${storage_class}"
+        fi
+        
+        vol_id=$((vol_id + 1))
+    done
+    
+    if [[ $vol_id -eq 0 ]]; then
+        print_error "No valid sizes found in comma-separated list: $sizes_list"
+        exit 1
+    fi
+    
+    echo -e "$storage_yaml"
+}
+
 # Function to check if namespace exists
 check_namespace() {
     if ! oc get namespace "$NAMESPACE" &> /dev/null; then
@@ -239,24 +391,33 @@ migrate_existing_kafka_pool() {
     
     # Step 2: Get storage configuration from existing 'kafka' pool
     local existing_storage_type=$(oc get kafkanodepool kafka -n "$NAMESPACE" -o jsonpath='{.spec.storage.type}' 2>/dev/null)
-    local existing_storage_size=$(oc get kafkanodepool kafka -n "$NAMESPACE" -o jsonpath='{.spec.storage.size}' 2>/dev/null)
-    local existing_storage_class=$(oc get kafkanodepool kafka -n "$NAMESPACE" -o jsonpath='{.spec.storage.class}' 2>/dev/null)
-    local existing_storage_delete_claim=$(oc get kafkanodepool kafka -n "$NAMESPACE" -o jsonpath='{.spec.storage.deleteClaim}' 2>/dev/null)
-    local existing_storage_id=$(oc get kafkanodepool kafka -n "$NAMESPACE" -o jsonpath='{.spec.storage.id}' 2>/dev/null)
     local existing_replicas=$(oc get kafkanodepool kafka -n "$NAMESPACE" -o jsonpath='{.spec.replicas}' 2>/dev/null)
     
     # Step 3: Create target node pool (without brokers field - KafkaRebalance will handle migration)
     print_info "Creating target node pool '$new_pool_name' for Kafka instance '$old_pool_cluster'..."
     
-    local storage_yaml="    type: ${existing_storage_type}\n    size: ${existing_storage_size}"
-    if [[ -n "$existing_storage_class" && "$existing_storage_class" != "null" ]]; then
-        storage_yaml="${storage_yaml}\n    class: ${existing_storage_class}"
-    fi
-    if [[ -n "$existing_storage_delete_claim" && "$existing_storage_delete_claim" != "null" ]]; then
-        storage_yaml="${storage_yaml}\n    deleteClaim: ${existing_storage_delete_claim}"
-    fi
-    if [[ -n "$existing_storage_id" && "$existing_storage_id" != "null" ]]; then
-        storage_yaml="${storage_yaml}\n    id: ${existing_storage_id}"
+    # Handle JBOD vs single storage
+    local storage_yaml=""
+    if [[ "$existing_storage_type" == "jbod" ]]; then
+        print_info "Detected JBOD storage in existing 'kafka' node pool"
+        storage_yaml=$(build_jbod_storage_yaml_from_pool "kafka")
+    else
+        # Single storage configuration
+        local existing_storage_size=$(oc get kafkanodepool kafka -n "$NAMESPACE" -o jsonpath='{.spec.storage.size}' 2>/dev/null)
+        local existing_storage_class=$(oc get kafkanodepool kafka -n "$NAMESPACE" -o jsonpath='{.spec.storage.class}' 2>/dev/null)
+        local existing_storage_delete_claim=$(oc get kafkanodepool kafka -n "$NAMESPACE" -o jsonpath='{.spec.storage.deleteClaim}' 2>/dev/null)
+        local existing_storage_id=$(oc get kafkanodepool kafka -n "$NAMESPACE" -o jsonpath='{.spec.storage.id}' 2>/dev/null)
+        
+        storage_yaml="    type: ${existing_storage_type}\n    size: ${existing_storage_size}"
+        if [[ -n "$existing_storage_class" && "$existing_storage_class" != "null" ]]; then
+            storage_yaml="${storage_yaml}\n    class: ${existing_storage_class}"
+        fi
+        if [[ -n "$existing_storage_delete_claim" && "$existing_storage_delete_claim" != "null" ]]; then
+            storage_yaml="${storage_yaml}\n    deleteClaim: ${existing_storage_delete_claim}"
+        fi
+        if [[ -n "$existing_storage_id" && "$existing_storage_id" != "null" ]]; then
+            storage_yaml="${storage_yaml}\n    id: ${existing_storage_id}"
+        fi
     fi
     
     cat <<EOF | oc apply -f -
@@ -578,14 +739,8 @@ migrate_kafka_to_node_pools() {
         exit 1
     fi
     
-    # Convert storage JSON to YAML format for the node pool
-    # Extract storage fields and build YAML (oc doesn't have direct YAML output, so we build it)
+    # Get storage type first to determine if it's JBOD or single storage
     local storage_type=$(oc get kafka "$KAFKA_INSTANCE" -n "$NAMESPACE" -o jsonpath='{.spec.kafka.storage.type}' 2>/dev/null)
-    local storage_size=$(oc get kafka "$KAFKA_INSTANCE" -n "$NAMESPACE" -o jsonpath='{.spec.kafka.storage.size}' 2>/dev/null)
-    local storage_class=$(oc get kafka "$KAFKA_INSTANCE" -n "$NAMESPACE" -o jsonpath='{.spec.kafka.storage.class}' 2>/dev/null)
-    local storage_delete_claim=$(oc get kafka "$KAFKA_INSTANCE" -n "$NAMESPACE" -o jsonpath='{.spec.kafka.storage.deleteClaim}' 2>/dev/null)
-    local storage_id=$(oc get kafka "$KAFKA_INSTANCE" -n "$NAMESPACE" -o jsonpath='{.spec.kafka.storage.id}' 2>/dev/null)
-    local storage_overrides=$(oc get kafka "$KAFKA_INSTANCE" -n "$NAMESPACE" -o jsonpath='{.spec.kafka.storage.overrides}' 2>/dev/null)
     
     # Validate required storage fields
     if [[ -z "$storage_type" || "$storage_type" == "null" ]]; then
@@ -593,28 +748,43 @@ migrate_kafka_to_node_pools() {
         exit 1
     fi
     
-    if [[ -z "$storage_size" || "$storage_size" == "null" ]]; then
-        print_error "Storage size not found in Kafka resource spec.kafka.storage.size"
-        exit 1
-    fi
-    
-    # Build storage YAML section with all fields from Kafka resource
-    local storage_yaml="    type: ${storage_type}\n    size: ${storage_size}"
-    
-    # Add optional fields if they exist in the Kafka resource
-    if [[ -n "$storage_class" && "$storage_class" != "null" ]]; then
-        storage_yaml="${storage_yaml}\n    class: ${storage_class}"
-    fi
-    if [[ -n "$storage_delete_claim" && "$storage_delete_claim" != "null" ]]; then
-        storage_yaml="${storage_yaml}\n    deleteClaim: ${storage_delete_claim}"
-    fi
-    if [[ -n "$storage_id" && "$storage_id" != "null" ]]; then
-        storage_yaml="${storage_yaml}\n    id: ${storage_id}"
-    fi
-    if [[ -n "$storage_overrides" && "$storage_overrides" != "null" && "$storage_overrides" != "[]" ]]; then
-        # Storage overrides is an array, would need more complex handling
-        # For now, we'll note it but may need to handle this differently
-        print_warning "Storage overrides found in Kafka resource but not copied to node pool (complex field)"
+    # Handle JBOD vs single storage differently
+    local storage_yaml=""
+    if [[ "$storage_type" == "jbod" ]]; then
+        print_info "Detected JBOD storage configuration in Kafka resource"
+        storage_yaml=$(build_jbod_storage_yaml_from_kafka)
+    else
+        # Single storage configuration
+        local storage_size=$(oc get kafka "$KAFKA_INSTANCE" -n "$NAMESPACE" -o jsonpath='{.spec.kafka.storage.size}' 2>/dev/null)
+        
+        if [[ -z "$storage_size" || "$storage_size" == "null" ]]; then
+            print_error "Storage size not found in Kafka resource spec.kafka.storage.size"
+            exit 1
+        fi
+        
+        # Build storage YAML section with all fields from Kafka resource
+        storage_yaml="    type: ${storage_type}\n    size: ${storage_size}"
+        
+        # Add optional fields if they exist in the Kafka resource
+        local storage_class=$(oc get kafka "$KAFKA_INSTANCE" -n "$NAMESPACE" -o jsonpath='{.spec.kafka.storage.class}' 2>/dev/null)
+        local storage_delete_claim=$(oc get kafka "$KAFKA_INSTANCE" -n "$NAMESPACE" -o jsonpath='{.spec.kafka.storage.deleteClaim}' 2>/dev/null)
+        local storage_id=$(oc get kafka "$KAFKA_INSTANCE" -n "$NAMESPACE" -o jsonpath='{.spec.kafka.storage.id}' 2>/dev/null)
+        local storage_overrides=$(oc get kafka "$KAFKA_INSTANCE" -n "$NAMESPACE" -o jsonpath='{.spec.kafka.storage.overrides}' 2>/dev/null)
+        
+        if [[ -n "$storage_class" && "$storage_class" != "null" ]]; then
+            storage_yaml="${storage_yaml}\n    class: ${storage_class}"
+        fi
+        if [[ -n "$storage_delete_claim" && "$storage_delete_claim" != "null" ]]; then
+            storage_yaml="${storage_yaml}\n    deleteClaim: ${storage_delete_claim}"
+        fi
+        if [[ -n "$storage_id" && "$storage_id" != "null" ]]; then
+            storage_yaml="${storage_yaml}\n    id: ${storage_id}"
+        fi
+        if [[ -n "$storage_overrides" && "$storage_overrides" != "null" && "$storage_overrides" != "[]" ]]; then
+            # Storage overrides is an array, would need more complex handling
+            # For now, we'll note it but may need to handle this differently
+            print_warning "Storage overrides found in Kafka resource but not copied to node pool (complex field)"
+        fi
     fi
     
     # Create broker node pool named 'kafka' (standard name for broker pool)
@@ -647,7 +817,6 @@ EOF
     print_info "Verifying broker node pool matches Kafka resource configuration..."
     local node_pool_replicas=$(oc get kafkanodepool kafka -n "$NAMESPACE" -o jsonpath='{.spec.replicas}' 2>/dev/null)
     local node_pool_storage_type=$(oc get kafkanodepool kafka -n "$NAMESPACE" -o jsonpath='{.spec.storage.type}' 2>/dev/null)
-    local node_pool_storage_size=$(oc get kafkanodepool kafka -n "$NAMESPACE" -o jsonpath='{.spec.storage.size}' 2>/dev/null)
     
     if [[ "$node_pool_replicas" != "$kafka_replicas" ]]; then
         print_error "Replicas mismatch! Kafka resource: $kafka_replicas, Node pool: $node_pool_replicas"
@@ -659,12 +828,27 @@ EOF
         exit 1
     fi
     
-    if [[ "$node_pool_storage_size" != "$storage_size" ]]; then
-        print_error "Storage size mismatch! Kafka resource: $storage_size, Node pool: $node_pool_storage_size"
-        exit 1
+    # For JBOD, verify volumes count matches
+    if [[ "$storage_type" == "jbod" ]]; then
+        local kafka_vol_count=$(oc get kafka "$KAFKA_INSTANCE" -n "$NAMESPACE" -o jsonpath='{.spec.kafka.storage.volumes[*].id}' 2>/dev/null | wc -w)
+        local pool_vol_count=$(oc get kafkanodepool kafka -n "$NAMESPACE" -o jsonpath='{.spec.storage.volumes[*].id}' 2>/dev/null | wc -w)
+        
+        if [[ "$kafka_vol_count" != "$pool_vol_count" ]]; then
+            print_error "JBOD volumes count mismatch! Kafka resource: $kafka_vol_count, Node pool: $pool_vol_count"
+            exit 1
+        fi
+        print_success "Verified: Broker node pool replicas and JBOD storage match Kafka resource exactly ($kafka_vol_count volumes)"
+    else
+        # Single storage verification
+        local storage_size=$(oc get kafka "$KAFKA_INSTANCE" -n "$NAMESPACE" -o jsonpath='{.spec.kafka.storage.size}' 2>/dev/null)
+        local node_pool_storage_size=$(oc get kafkanodepool kafka -n "$NAMESPACE" -o jsonpath='{.spec.storage.size}' 2>/dev/null)
+        
+        if [[ "$node_pool_storage_size" != "$storage_size" ]]; then
+            print_error "Storage size mismatch! Kafka resource: $storage_size, Node pool: $node_pool_storage_size"
+            exit 1
+        fi
+        print_success "Verified: Broker node pool replicas and storage match Kafka resource exactly"
     fi
-    
-    print_success "Verified: Broker node pool replicas and storage match Kafka resource exactly"
     
     # Enable node pools in Kafka resource
     print_info "Enabling node pools in Kafka resource..."
@@ -794,76 +978,196 @@ create_controller_node_pool() {
     fi
     
     # Determine storage configuration
-    # Default to persistent-claim unless user explicitly specifies ephemeral
+    # First, check what storage the broker node pool uses (if it exists)
+    local broker_storage_type=""
+    local broker_node_pool=""
+    
+    # Check if 'kafka' node pool exists for this cluster
+    local kafka_pool_cluster=$(oc get kafkanodepool kafka -n "$NAMESPACE" -o jsonpath='{.metadata.labels.strimzi\.io/cluster}' 2>/dev/null || echo "")
+    
+    if [[ -n "$kafka_pool_cluster" && "$kafka_pool_cluster" == "$KAFKA_INSTANCE" ]]; then
+        broker_node_pool="kafka"
+        broker_storage_type=$(oc get kafkanodepool kafka -n "$NAMESPACE" -o jsonpath='{.spec.storage.type}' 2>/dev/null)
+        if [[ -n "$broker_storage_type" && "$broker_storage_type" != "null" ]]; then
+            print_info "Broker node pool 'kafka' uses storage type: ${broker_storage_type}"
+        fi
+    else
+        # Fallback: check Kafka resource directly (before migration to node pools)
+        broker_storage_type=$(oc get kafka "$KAFKA_INSTANCE" -n "$NAMESPACE" -o jsonpath='{.spec.kafka.storage.type}' 2>/dev/null)
+        if [[ -n "$broker_storage_type" && "$broker_storage_type" != "null" ]]; then
+            print_info "Kafka resource uses storage type: ${broker_storage_type}"
+        fi
+    fi
+    
+    # Determine controller storage type
     local storage_type=""
-    if [[ -n "$CONTROLLER_STORAGE_TYPE" ]]; then
+    
+    # Check if user provided comma-separated sizes (indicating JBOD)
+    local has_comma_sizes=false
+    if [[ -n "$CONTROLLER_STORAGE_SIZES" && "$CONTROLLER_STORAGE_SIZES" == *","* ]]; then
+        has_comma_sizes=true
+    fi
+    
+    # Determine controller storage type
+    if [[ "$has_comma_sizes" == true ]]; then
+        # Comma-separated sizes detected - auto-detect jbod type
+        if [[ -n "$CONTROLLER_STORAGE_TYPE" && "$CONTROLLER_STORAGE_TYPE" != "jbod" ]]; then
+            print_error "Comma-separated sizes provided (indicating JBOD) but storage type is set to '${CONTROLLER_STORAGE_TYPE}'"
+            print_error "When providing comma-separated sizes, storage type must be 'jbod' or omitted (will default to jbod)"
+            exit 1
+        fi
+        storage_type="jbod"
+        print_info "Auto-detected JBOD storage type from comma-separated sizes"
+    elif [[ -n "$CONTROLLER_STORAGE_TYPE" ]]; then
         # Validate user-provided storage type
-        if [[ "$CONTROLLER_STORAGE_TYPE" != "persistent-claim" && "$CONTROLLER_STORAGE_TYPE" != "ephemeral" ]]; then
+        if [[ "$CONTROLLER_STORAGE_TYPE" != "persistent-claim" && "$CONTROLLER_STORAGE_TYPE" != "ephemeral" && "$CONTROLLER_STORAGE_TYPE" != "jbod" ]]; then
             print_error "Invalid controller storage type: $CONTROLLER_STORAGE_TYPE"
-            print_error "Valid options are: persistent-claim, ephemeral"
+            print_error "Valid options are: persistent-claim, ephemeral, jbod"
             exit 1
         fi
         storage_type="$CONTROLLER_STORAGE_TYPE"
         print_info "Using user-provided controller storage type=${storage_type}"
+        
+        # Validate that if jbod is specified, sizes are provided
+        if [[ "$storage_type" == "jbod" && -z "$CONTROLLER_STORAGE_SIZES" ]]; then
+            # Check if we can default to broker's JBOD config
+            if [[ "$broker_storage_type" != "jbod" ]]; then
+                print_error "JBOD storage type specified but no sizes provided (--controller-storage-sizes)"
+                print_error "Please provide --controller-storage-sizes with comma-separated sizes when using --controller-storage-type jbod"
+                exit 1
+            fi
+        fi
     else
-        # Default to persistent-claim
-        storage_type="persistent-claim"
-        print_info "Using default controller storage type=${storage_type}"
+        # Default to broker storage type if available, otherwise persistent-claim
+        if [[ -n "$broker_storage_type" && "$broker_storage_type" != "null" ]]; then
+            storage_type="$broker_storage_type"
+            print_info "Using broker storage type as default: ${storage_type}"
+        else
+            storage_type="persistent-claim"
+            print_info "Using default controller storage type=${storage_type} (broker storage type not found)"
+        fi
     fi
     
-    # Validate storage size requirement: persistent-claim requires storage size, ephemeral does not
-    if [[ "$storage_type" != "ephemeral" ]]; then
-        if [[ -z "$CONTROLLER_STORAGE_SIZE" ]]; then
-            print_error "Controller storage type is '${storage_type}', which requires storage size to be provided."
-            print_error "Please provide --controller-storage-size when using storage type '${storage_type}'."
+    # Build storage YAML based on storage type
+    local storage_yaml=""
+    
+    if [[ "$storage_type" == "jbod" ]]; then
+        # Handle JBOD storage
+        if [[ -n "$CONTROLLER_STORAGE_SIZES" ]]; then
+            # User provided comma-separated sizes
+            print_info "Using user-provided JBOD sizes for controller: ${CONTROLLER_STORAGE_SIZES}"
+            # Get storage class to apply to all volumes
+            local jbod_storage_class=""
+            if [[ -n "$CONTROLLER_STORAGE_CLASS" ]]; then
+                jbod_storage_class="$CONTROLLER_STORAGE_CLASS"
+            elif [[ "$broker_storage_type" == "jbod" && -n "$broker_node_pool" ]]; then
+                # Try to get storage class from first volume of broker's JBOD config
+                jbod_storage_class=$(oc get kafkanodepool "$broker_node_pool" -n "$NAMESPACE" -o jsonpath='{.spec.storage.volumes[0].class}' 2>/dev/null)
+            elif [[ "$broker_storage_type" == "jbod" ]]; then
+                jbod_storage_class=$(oc get kafka "$KAFKA_INSTANCE" -n "$NAMESPACE" -o jsonpath='{.spec.kafka.storage.volumes[0].class}' 2>/dev/null)
+            fi
+            # Fallback to ZooKeeper storage class
+            if [[ -z "$jbod_storage_class" || "$jbod_storage_class" == "null" ]]; then
+                jbod_storage_class=$(oc get kafka "$KAFKA_INSTANCE" -n "$NAMESPACE" -o jsonpath='{.spec.zookeeper.storage.class}' 2>/dev/null)
+            fi
+            storage_yaml=$(build_jbod_storage_yaml_from_sizes "$CONTROLLER_STORAGE_SIZES" "$jbod_storage_class")
+        elif [[ "$broker_storage_type" == "jbod" && -n "$broker_node_pool" ]]; then
+            # Default to broker's JBOD configuration
+            print_info "Using broker's JBOD configuration as default for controller"
+            storage_yaml=$(build_jbod_storage_yaml_from_pool "$broker_node_pool")
+        elif [[ "$broker_storage_type" == "jbod" ]]; then
+            # Broker uses JBOD but not in node pool yet - get from Kafka resource
+            print_info "Using broker's JBOD configuration from Kafka resource as default for controller"
+            storage_yaml=$(build_jbod_storage_yaml_from_kafka)
+        else
+            print_error "JBOD storage type specified but no sizes provided and broker doesn't use JBOD"
+            print_error "Please provide --controller-storage-sizes with comma-separated sizes when using --controller-storage-type jbod"
             exit 1
         fi
-    fi
-    
-    # Now determine storage size and other storage fields
-    local controller_storage_size=""
-    local storage_class=""
-    local storage_delete_claim=""
-    local storage_id=""
-    
-    if [[ "$storage_type" == "ephemeral" ]]; then
-        # For ephemeral storage, size is not required
-        if [[ -n "$CONTROLLER_STORAGE_SIZE" ]]; then
-            print_warning "Storage size provided for ephemeral storage type, but it will be ignored"
+    elif [[ "$storage_type" == "ephemeral" ]]; then
+        # Ephemeral storage
+        if [[ -n "$CONTROLLER_STORAGE_SIZES" ]]; then
+            print_warning "Storage sizes provided for ephemeral storage type, but it will be ignored"
         fi
-        # Ephemeral storage doesn't need size, class, deleteClaim, or id
+        storage_yaml="    type: ephemeral"
         print_info "Using ephemeral storage (no size required)"
     else
-        # For persistent-claim, storage size is required (already validated above)
-        controller_storage_size="$CONTROLLER_STORAGE_SIZE"
-        print_info "Using controller storage size=${controller_storage_size}"
-        
-        # Use user-provided storage class if provided, otherwise use ZooKeeper storage class
-        if [[ -n "$CONTROLLER_STORAGE_CLASS" ]]; then
-            storage_class="$CONTROLLER_STORAGE_CLASS"
-            print_info "Using user-provided controller storage class=${storage_class}"
-        else
-            storage_class=$(oc get kafka "$KAFKA_INSTANCE" -n "$NAMESPACE" -o jsonpath='{.spec.zookeeper.storage.class}' 2>/dev/null)
-            if [[ -n "$storage_class" && "$storage_class" != "null" ]]; then
-                print_info "Using ZooKeeper storage class=${storage_class} as default"
+        # Persistent-claim storage
+        # Validate storage size requirement
+        local controller_storage_size=""
+        if [[ -n "$CONTROLLER_STORAGE_SIZES" ]]; then
+            # Single size provided (non-JBOD)
+            controller_storage_size="$CONTROLLER_STORAGE_SIZES"
+            print_info "Using user-provided controller storage size=${controller_storage_size}"
+        elif [[ "$broker_storage_type" == "persistent-claim" && -n "$broker_node_pool" ]]; then
+            # Default to broker's storage size
+            controller_storage_size=$(oc get kafkanodepool "$broker_node_pool" -n "$NAMESPACE" -o jsonpath='{.spec.storage.size}' 2>/dev/null)
+            if [[ -n "$controller_storage_size" && "$controller_storage_size" != "null" ]]; then
+                print_info "Using broker storage size as default: ${controller_storage_size}"
+            fi
+        elif [[ "$broker_storage_type" == "persistent-claim" ]]; then
+            # Get from Kafka resource
+            controller_storage_size=$(oc get kafka "$KAFKA_INSTANCE" -n "$NAMESPACE" -o jsonpath='{.spec.kafka.storage.size}' 2>/dev/null)
+            if [[ -n "$controller_storage_size" && "$controller_storage_size" != "null" ]]; then
+                print_info "Using broker storage size from Kafka resource as default: ${controller_storage_size}"
             fi
         fi
         
-        # Get optional storage fields from ZooKeeper if not explicitly set
-        storage_delete_claim=$(oc get kafka "$KAFKA_INSTANCE" -n "$NAMESPACE" -o jsonpath='{.spec.zookeeper.storage.deleteClaim}' 2>/dev/null)
-        storage_id=$(oc get kafka "$KAFKA_INSTANCE" -n "$NAMESPACE" -o jsonpath='{.spec.zookeeper.storage.id}' 2>/dev/null)
-    fi
-    
-    # Build storage YAML section
-    local storage_yaml="    type: ${storage_type}"
-    
-    # Add size only for persistent-claim storage type
-    if [[ "$storage_type" == "persistent-claim" ]]; then
-        storage_yaml="${storage_yaml}\n    size: ${controller_storage_size}"
-    fi
-    
-    # Add optional fields only for persistent-claim storage type
-    if [[ "$storage_type" == "persistent-claim" ]]; then
+        if [[ -z "$controller_storage_size" || "$controller_storage_size" == "null" ]]; then
+            print_error "Controller storage type is '${storage_type}', which requires storage size to be provided."
+            print_error "Please provide --controller-storage-sizes when using storage type '${storage_type}'."
+            exit 1
+        fi
+        
+        # Build storage YAML
+        storage_yaml="    type: ${storage_type}\n    size: ${controller_storage_size}"
+        
+        # Get storage class
+        local storage_class=""
+        if [[ -n "$CONTROLLER_STORAGE_CLASS" ]]; then
+            storage_class="$CONTROLLER_STORAGE_CLASS"
+            print_info "Using user-provided controller storage class=${storage_class}"
+        elif [[ "$broker_storage_type" == "persistent-claim" && -n "$broker_node_pool" ]]; then
+            storage_class=$(oc get kafkanodepool "$broker_node_pool" -n "$NAMESPACE" -o jsonpath='{.spec.storage.class}' 2>/dev/null)
+            if [[ -n "$storage_class" && "$storage_class" != "null" ]]; then
+                print_info "Using broker storage class as default: ${storage_class}"
+            fi
+        elif [[ "$broker_storage_type" == "persistent-claim" ]]; then
+            storage_class=$(oc get kafka "$KAFKA_INSTANCE" -n "$NAMESPACE" -o jsonpath='{.spec.kafka.storage.class}' 2>/dev/null)
+            if [[ -n "$storage_class" && "$storage_class" != "null" ]]; then
+                print_info "Using broker storage class from Kafka resource as default: ${storage_class}"
+            fi
+        fi
+        
+        # Fallback to ZooKeeper storage class if broker doesn't have one
+        if [[ -z "$storage_class" || "$storage_class" == "null" ]]; then
+            storage_class=$(oc get kafka "$KAFKA_INSTANCE" -n "$NAMESPACE" -o jsonpath='{.spec.zookeeper.storage.class}' 2>/dev/null)
+            if [[ -n "$storage_class" && "$storage_class" != "null" ]]; then
+                print_info "Using ZooKeeper storage class as default: ${storage_class}"
+            fi
+        fi
+        
+        # Get optional storage fields
+        local storage_delete_claim=""
+        local storage_id=""
+        
+        if [[ "$broker_storage_type" == "persistent-claim" && -n "$broker_node_pool" ]]; then
+            storage_delete_claim=$(oc get kafkanodepool "$broker_node_pool" -n "$NAMESPACE" -o jsonpath='{.spec.storage.deleteClaim}' 2>/dev/null)
+            storage_id=$(oc get kafkanodepool "$broker_node_pool" -n "$NAMESPACE" -o jsonpath='{.spec.storage.id}' 2>/dev/null)
+        elif [[ "$broker_storage_type" == "persistent-claim" ]]; then
+            storage_delete_claim=$(oc get kafka "$KAFKA_INSTANCE" -n "$NAMESPACE" -o jsonpath='{.spec.kafka.storage.deleteClaim}' 2>/dev/null)
+            storage_id=$(oc get kafka "$KAFKA_INSTANCE" -n "$NAMESPACE" -o jsonpath='{.spec.kafka.storage.id}' 2>/dev/null)
+        fi
+        
+        # Fallback to ZooKeeper if not found in broker
+        if [[ -z "$storage_delete_claim" || "$storage_delete_claim" == "null" ]]; then
+            storage_delete_claim=$(oc get kafka "$KAFKA_INSTANCE" -n "$NAMESPACE" -o jsonpath='{.spec.zookeeper.storage.deleteClaim}' 2>/dev/null)
+        fi
+        if [[ -z "$storage_id" || "$storage_id" == "null" ]]; then
+            storage_id=$(oc get kafka "$KAFKA_INSTANCE" -n "$NAMESPACE" -o jsonpath='{.spec.zookeeper.storage.id}' 2>/dev/null)
+        fi
+        
+        # Add optional fields
         if [[ -n "$storage_class" && "$storage_class" != "null" ]]; then
             storage_yaml="${storage_yaml}\n    class: ${storage_class}"
         fi
@@ -1275,4 +1579,5 @@ main() {
 
 # Run main function
 main "$@"
+
 
