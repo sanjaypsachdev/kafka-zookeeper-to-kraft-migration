@@ -139,9 +139,15 @@ oc get kafka <kafka-instance-name> -n <namespace> -o jsonpath='{.metadata.annota
 
 If this returns `enabled`, your cluster is already running in KRaft mode and no migration is needed.
 
+## Manual Migration Steps
+
+> **Note**: If you're using the automated migration script (`zk-to-kafka-migration.sh`), you can skip the manual steps below. The script automatically handles all phases of the migration. The following sections are provided for users who prefer manual control or need to understand the process in detail.
+
 ## Phase 1: Migrating to Node Pools
 
 Before migrating to KRaft, your Kafka instance must use the KafkaNodePool architecture. If your Kafka resource still has direct broker configuration (spec.kafka.replicas and spec.kafka.storage), you need to migrate to node pools first.
+
+> **Note**: The automated script (`zk-to-kafka-migration.sh`) will automatically detect if node pool migration is needed and handle it for you.
 
 ### Checking Current Configuration
 
@@ -580,6 +586,128 @@ Look for:
 - Storage class is available
 - Sufficient storage quota
 - Pod scheduling constraints
+
+## Automated Migration Script
+
+This repository provides an automation script to simplify the migration process:
+
+**Bash Script** (`zk-to-kafka-migration.sh`): Uses OpenShift CLI (`oc`) commands
+
+The script automates the entire migration process, including:
+- Checking prerequisites
+- Migrating to node pools (if needed)
+- Creating controller node pools
+- Enabling KRaft migration
+- Monitoring migration progress
+- Enabling KRaft mode
+- Cleaning up ZooKeeper configuration
+
+### Using the Bash Script
+
+The bash script uses the OpenShift CLI (`oc`) and requires no additional dependencies beyond what's typically available in a Linux/Unix environment.
+
+#### Prerequisites for Bash Script
+
+- `oc` CLI installed and configured
+- `bash` shell (version 4.0 or higher)
+- Logged in to your OpenShift cluster: `oc login <cluster-url>`
+
+#### Running the Bash Script
+
+**Basic usage:**
+```bash
+./zk-to-kafka-migration.sh <namespace> <kafka-instance-name>
+```
+
+**Examples:**
+
+1. **Basic migration:**
+   ```bash
+   ./zk-to-kafka-migration.sh my-namespace my-kafka
+   ```
+
+2. **With custom controller pool name:**
+   ```bash
+   ./zk-to-kafka-migration.sh my-namespace my-kafka --controller-pool-name my-controller-pool
+   ```
+
+3. **With custom controller replicas and storage:**
+   ```bash
+   ./zk-to-kafka-migration.sh my-namespace my-kafka --controller-replicas 5 --controller-storage-sizes 200Gi
+   ```
+
+4. **With custom storage class:**
+   ```bash
+   ./zk-to-kafka-migration.sh my-namespace my-kafka --controller-storage-sizes 200Gi --controller-storage-class fast-ssd
+   ```
+
+5. **With JBOD storage:**
+   ```bash
+   ./zk-to-kafka-migration.sh my-namespace my-kafka --controller-storage-type jbod --controller-storage-sizes "100Gi,200Gi,300Gi"
+   ```
+
+6. **With custom timeout:**
+   ```bash
+   ./zk-to-kafka-migration.sh my-namespace my-kafka --wait-timeout 7200
+   ```
+
+7. **Skip prerequisite checks:**
+   ```bash
+   ./zk-to-kafka-migration.sh my-namespace my-kafka --skip-prereq-check
+   ```
+
+**View all options:**
+```bash
+./zk-to-kafka-migration.sh --help
+```
+
+#### Bash Script Options
+
+- `--controller-pool-name NAME`: Name for the controller node pool (default: `controller-{kafka-instance-name}`)
+- `--controller-replicas NUM`: Number of controller replicas (default: ZooKeeper replicas from Kafka resource)
+- `--controller-storage-type TYPE`: Storage type for controller node pool (default: matches broker storage, options: `persistent-claim`, `ephemeral`, `jbod`)
+- `--controller-storage-sizes SIZES`: Storage size(s) for controller node pool
+  - For non-JBOD: single size (e.g., `"200Gi"`)
+  - For JBOD: comma-separated list (e.g., `"100Gi,200Gi,300Gi"`)
+- `--controller-storage-class CLASS`: Storage class for controller node pool (default: matches broker storage or ZooKeeper storage class)
+- `--wait-timeout SECONDS`: Timeout for waiting on migration states (default: 3600)
+- `--skip-prereq-check`: Skip prerequisite checks
+
+
+### Script Output
+
+Both scripts provide colored output to indicate progress:
+- **Blue [INFO]**: Informational messages
+- **Green [SUCCESS]**: Successful operations
+- **Yellow [WARNING]**: Warning messages
+- **Red [ERROR]**: Error messages
+
+The scripts will automatically:
+1. Check prerequisites and migrate to node pools if needed
+2. Create the controller node pool with appropriate configuration
+3. Enable KRaft migration mode
+4. Monitor migration progress through all states
+5. Enable full KRaft mode when ready
+6. Clean up ZooKeeper configuration
+
+### Troubleshooting Script Issues
+
+**Bash Script:**
+- Ensure `oc` is in your PATH and properly configured
+- Verify you're logged in: `oc whoami`
+- Check script permissions: `chmod +x zk-to-kafka-migration.sh`
+
+**Python Script:**
+- Ensure virtual environment is activated: `source venv/bin/activate`
+- Verify dependencies are installed: `pip list | grep openshift`
+- Check Python version: `python3 --version` (should be 3.6+)
+- Verify OpenShift client can connect: The script will test this on startup
+
+**Common Issues:**
+- **Import errors**: Make sure virtual environment is activated and dependencies are installed
+- **OpenShift client errors**: Verify you're logged in with `oc login`
+- **Permission errors**: Ensure you have appropriate RBAC permissions in the namespace
+- **Resource not found**: Verify namespace and Kafka instance name are correct
 
 ## Summary
 
