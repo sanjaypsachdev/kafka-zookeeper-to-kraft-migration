@@ -1,0 +1,36 @@
+# Cluster-scoped read access for the agent's prerequisite checks:
+#   - check_namespace            -> get namespaces (cluster-scoped resource)
+#   - detect_kafkanodepool_api_version -> get the KafkaNodePool CRD
+#
+# This is OPTIONAL. If you always run the agent with --skip-prereq-check, you can
+# skip this file and the binding below entirely. Edit the binding's namespace
+# placeholder before applying.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: kafka-migration-agent-read
+  labels:
+    app: kafka-migration-agent
+rules:
+  - apiGroups: [""]
+    resources: ["namespaces"]
+    verbs: ["get"]
+  - apiGroups: ["apiextensions.k8s.io"]
+    resources: ["customresourcedefinitions"]
+    verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: kafka-migration-agent-read
+  labels:
+    app: kafka-migration-agent
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: kafka-migration-agent-read
+subjects:
+  - kind: ServiceAccount
+    name: kafka-migration-agent
+    # Replace with the namespace where the ServiceAccount lives.
+    namespace: REPLACE_WITH_NAMESPACE

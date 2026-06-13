@@ -1,0 +1,39 @@
+# OPTIONAL: build the image inside the cluster (Docker strategy) straight from
+# the Git repo, for users who cannot build/push from a workstation.
+#
+#   oc apply -f buildconfig.yaml
+#   oc start-build kafka-migration-agent --follow
+#
+# The resulting image lands in the internal registry as:
+#   image-registry.openshift-image-registry.svc:5000/<ns>/kafka-migration-agent:latest
+apiVersion: image.openshift.io/v1
+kind: ImageStream
+metadata:
+  name: kafka-migration-agent
+  labels:
+    app: kafka-migration-agent
+---
+apiVersion: build.openshift.io/v1
+kind: BuildConfig
+metadata:
+  name: kafka-migration-agent
+  labels:
+    app: kafka-migration-agent
+spec:
+  source:
+    type: Git
+    git:
+      uri: https://github.com/REPLACE_WITH_OWNER/REPLACE_WITH_REPO.git
+      ref: main
+    # The Dockerfile lives in the kafka-agent/ subdirectory.
+    contextDir: kafka-agent
+  strategy:
+    type: Docker
+    dockerStrategy:
+      dockerfilePath: Dockerfile
+  output:
+    to:
+      kind: ImageStreamTag
+      name: kafka-migration-agent:latest
+  triggers:
+    - type: ConfigChange

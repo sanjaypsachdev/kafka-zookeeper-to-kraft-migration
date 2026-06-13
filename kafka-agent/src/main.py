@@ -7,6 +7,7 @@ Usage:
 The interface mirrors the original zk-to-kafka-migration.sh bash script.
 """
 
+import os
 import sys
 import uuid
 
@@ -79,6 +80,16 @@ def _extract_last_agent_text(messages: list) -> str:
     help="Timeout in seconds for each migration state wait.",
 )
 @click.option("--skip-prereq-check", is_flag=True, default=False, help="Skip prerequisite checks.")
+@click.option(
+    "--auto-approve",
+    is_flag=True,
+    default=lambda: os.getenv("KRAFT_AUTO_APPROVE", "").strip().lower() in ("1", "true", "yes"),
+    help=(
+        "Automatically approve the KRaft activation step instead of prompting. "
+        "Required for non-interactive runs (e.g. a Kubernetes Job). "
+        "Can also be set via the KRAFT_AUTO_APPROVE environment variable."
+    ),
+)
 def main(
     namespace: str,
     kafka_instance_name: str,
@@ -89,6 +100,7 @@ def main(
     controller_storage_class: str,
     wait_timeout: int,
     skip_prereq_check: bool,
+    auto_approve: bool,
 ) -> None:
     console.print(
         Panel.fit(
@@ -164,12 +176,20 @@ def main(
                     console.print(Panel(intr.value.get("message", str(intr.value)), border_style="yellow"))
 
     if interrupted:
-        # Prompt operator for decision
-        decision = click.prompt(
-            "\nYour decision",
-            default="no",
-            show_default=True,
-        )
+        if auto_approve:
+            # Non-interactive mode (e.g. a Kubernetes Job): no stdin to prompt on.
+            decision = "yes"
+            console.print(
+                "[bold yellow]--auto-approve set: approving KRaft activation "
+                "without prompting (non-interactive mode).[/bold yellow]"
+            )
+        else:
+            # Prompt operator for decision
+            decision = click.prompt(
+                "\nYour decision",
+                default="no",
+                show_default=True,
+            )
 
         console.print()
         console.print(Rule("[bold cyan]Resuming Migration[/bold cyan]"))

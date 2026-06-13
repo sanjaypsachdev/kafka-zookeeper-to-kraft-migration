@@ -60,6 +60,30 @@ The script handles both standard `persistent-claim` and multi-disk JBOD volumes.
 
 `get_kafkanodepool_api_version()` determines the correct `apiVersion` at runtime by checking existing resources, then the CRD, then `oc api-resources`. Falls back to `kafka.strimzi.io/v1beta2`.
 
+## AI Agent (`kafka-agent/`)
+
+A LangGraph re-implementation of the migration as an LLM-driven agent. It is a
+`uv`-managed Python project (Python ≥3.12). `src/tools.py` wraps every cluster
+operation as an `oc` subprocess call; `src/graph.py` defines the phased
+StateGraph with a human-approval `interrupt()` before KRaft activation;
+`src/config.py` selects the LLM (Anthropic, or any OpenAI-compatible endpoint via
+`OPENAI_BASE_URL`). Entry point: `uv run python -m src.main <ns> <kafka> [opts]`.
+
+### Containerized / OpenShift deployment
+
+- `kafka-agent/Dockerfile` — UBI9 `python-312` base, bundles the `oc` client,
+  builds the venv with `uv sync --frozen`, runs as numeric `USER 1001` (group 0)
+  for `restricted-v2` SCC. Build: `cd kafka-agent && podman build -t kafka-migration-agent .`
+- In-cluster it authenticates via the ServiceAccount token (no `oc login`).
+  `kafka-agent/openshift/` holds the `ServiceAccount`, least-privilege `Role`
+  (matches `src/tools.py`), optional namespace-read `ClusterRole`, an LLM
+  `Secret` example (defaults to OpenShift AI model serving via the OpenAI
+  interface), a `Job` (non-interactive, needs `--auto-approve`), an interactive
+  `Pod` for `oc rsh`, and an optional `BuildConfig`.
+- `--auto-approve` (or `KRAFT_AUTO_APPROVE=true`) bypasses the interactive
+  approval prompt for non-interactive `Job` runs (`src/main.py`).
+- Full instructions: `kafka-agent/README.md`.
+
 ## Updating Architecture Diagrams
 
 Diagram source is in `mermaid-diagrams.md`. To regenerate the PNGs in `images/`:

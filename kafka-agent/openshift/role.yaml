@@ -1,0 +1,27 @@
+# Namespaced, least-privilege Role covering exactly the oc operations the agent
+# performs (see kafka-agent/src/tools.py). Apply in the namespace that holds the
+# Kafka instance being migrated.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: kafka-migration-agent
+  labels:
+    app: kafka-migration-agent
+rules:
+  # Kafka custom resource: inspect, annotate (strimzi.io/kraft, node-pools),
+  # and patch (remove zookeeper, enable cruiseControl, etc.).
+  - apiGroups: ["kafka.strimzi.io"]
+    resources: ["kafkas"]
+    verbs: ["get", "list", "watch", "patch", "update"]
+  # Broker/controller node pools: create, inspect, evacuate, delete.
+  - apiGroups: ["kafka.strimzi.io"]
+    resources: ["kafkanodepools"]
+    verbs: ["get", "list", "watch", "create", "patch", "update", "delete"]
+  # Rebalance used to evacuate partitions before deleting a conflicting pool.
+  - apiGroups: ["kafka.strimzi.io"]
+    resources: ["kafkarebalances"]
+    verbs: ["get", "list", "watch", "create", "patch", "update"]
+  # Pod readiness checks during migration state waits.
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch"]

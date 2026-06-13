@@ -1,0 +1,47 @@
+# Non-interactive batch run of the migration agent. Because a Job has no
+# interactive stdin, --auto-approve is passed so the KRaft activation step is
+# approved automatically. Only use this when unattended approval is acceptable;
+# otherwise use pod-interactive.yaml + `oc rsh`.
+#
+# Edit the image reference and the args (namespace / kafka instance / options)
+# before applying.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: kafka-migration-agent
+  labels:
+    app: kafka-migration-agent
+spec:
+  backoffLimit: 0
+  template:
+    metadata:
+      labels:
+        app: kafka-migration-agent
+    spec:
+      serviceAccountName: kafka-migration-agent
+      restartPolicy: Never
+      containers:
+        - name: agent
+          image: REPLACE_WITH_IMAGE   # e.g. image-registry.openshift-image-registry.svc:5000/<ns>/kafka-migration-agent:latest
+          imagePullPolicy: Always
+          envFrom:
+            - secretRef:
+                name: kafka-migration-agent-llm
+          args:
+            - "REPLACE_WITH_NAMESPACE"
+            - "REPLACE_WITH_KAFKA_INSTANCE"
+            - "--auto-approve"
+            # Optional controller pool overrides:
+            # - "--controller-replicas"
+            # - "3"
+            # - "--controller-storage-type"
+            # - "persistent-claim"
+            # - "--controller-storage-sizes"
+            # - "100Gi"
+          resources:
+            requests:
+              cpu: "250m"
+              memory: "256Mi"
+            limits:
+              cpu: "1"
+              memory: "512Mi"

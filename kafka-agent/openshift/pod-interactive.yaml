@@ -1,0 +1,32 @@
+# Long-lived pod for INTERACTIVE migration runs. The container idles; you then
+# `oc rsh` in and run the agent yourself, so the human-approval prompt works:
+#
+#   oc apply -f pod-interactive.yaml
+#   oc rsh pod/kafka-migration-agent
+#   python -m src.main <namespace> <kafka-instance> [options]
+#
+# (This is also the pattern for using the image as an OpenShift AI workbench.)
+apiVersion: v1
+kind: Pod
+metadata:
+  name: kafka-migration-agent
+  labels:
+    app: kafka-migration-agent
+spec:
+  serviceAccountName: kafka-migration-agent
+  restartPolicy: Never
+  containers:
+    - name: agent
+      image: REPLACE_WITH_IMAGE
+      imagePullPolicy: Always
+      command: ["sleep", "infinity"]
+      envFrom:
+        - secretRef:
+            name: kafka-migration-agent-llm
+      resources:
+        requests:
+          cpu: "250m"
+          memory: "256Mi"
+        limits:
+          cpu: "1"
+          memory: "512Mi"
