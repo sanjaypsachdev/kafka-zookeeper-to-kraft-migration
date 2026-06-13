@@ -1,5 +1,6 @@
 .DS_Store
 README.html
+.venv/
 kafka-agent/.venv/
 kafka-agent/src/__pycache__/
 kafka-agent/src/nodes/__pycache__/
