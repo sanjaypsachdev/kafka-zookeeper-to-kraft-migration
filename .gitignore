@@ -1,0 +1,7 @@
+.DS_Store
+README.html
+kafka-agent/.venv/
+kafka-agent/src/__pycache__/
+kafka-agent/src/nodes/__pycache__/
+*.pyc
+__pycache__/
