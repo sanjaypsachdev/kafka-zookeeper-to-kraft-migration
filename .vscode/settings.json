@@ -1,0 +1,4 @@
+{
+  "python.defaultInterpreterPath": "${workspaceFolder}/kafka-agent/.venv/bin/python",
+  "python.analysis.extraPaths": ["${workspaceFolder}/kafka-agent/src"]
+}
